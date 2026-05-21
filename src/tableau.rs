@@ -48,9 +48,6 @@ fn build_tableau(c: Vec<f64>, a_data: Vec<f64>) -> RadauTableau {
         .expect("Radau A matrix must be invertible");
     let b: Vec<f64> = a.row(s - 1).iter().copied().collect();
     let b_hat = build_embedded_b(&c);
-    
-    let transform = BlockDiagTransform::from_a_inv(&a_inv);
-
     RadauTableau { order, stages: s, c, a, a_inv, b, b_hat }
 }
 
