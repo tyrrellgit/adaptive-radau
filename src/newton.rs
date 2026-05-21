@@ -45,17 +45,30 @@ impl CachedJacobian {
     }
 }
 
+/// Result of the Newton solve for one Radau step.
+///
+/// Stages are stored as **increments** `Z_i = Y_i - y_n` rather than absolute
+/// `Y_i`. This is essential for numerical accuracy at small step sizes:
+/// computing `Y_i - y_n` by subtraction loses precision when `|Y_i| ≈ |y_n|`
+/// and the difference is much smaller than either operand. The downstream
+/// ESTRAD error estimator divides these increments by `h`, so any loss of
+/// significance here would be amplified into the error norm.
 #[derive(Debug, Clone)]
 pub struct NewtonState {
+    /// Stage increments `Z_i = Y_i - y_n` (shape: stages × n).
+    pub increments: Vec<Vec<f64>>,
+    /// Stage absolute values `Y_i = y_n + Z_i` (recomputed at convergence so
+    /// integrator code can read them without recomputing).
     pub stages: Vec<Vec<f64>>,
     pub iter_count: usize,
     pub converged: bool,
 }
 
 impl NewtonState {
-    pub fn new(stage_count: usize, y0: &[f64]) -> Self {
+    pub fn new(stage_count: usize, n: usize) -> Self {
         Self {
-            stages: vec![y0.to_vec(); stage_count],
+            increments: vec![vec![0.0; n]; stage_count],
+            stages: vec![vec![0.0; n]; stage_count],
             iter_count: 0,
             converged: false,
         }
@@ -159,19 +172,27 @@ fn newton_loop(
     let s = tableau.stages;
     let sn = s * n;
 
-    let mut state = NewtonState::new(s, y);
+    let mut state = NewtonState::new(s, n);
     let mut fvals = vec![vec![0.0; n]; s];
+    // Y_i = y + Z_i; updated whenever Z is corrected.
+    let mut y_stage = vec![0.0; n];
 
     for iter in 0..max_iter {
         for i in 0..s {
             let ti = t + tableau.c[i] * h;
-            problem.rhs(ti, &state.stages[i], &mut fvals[i]);
+            for j in 0..n {
+                y_stage[j] = y[j] + state.increments[i][j];
+            }
+            problem.rhs(ti, &y_stage, &mut fvals[i]);
         }
 
+        // Collocation residual in increment form:
+        //   r_i = Z_i - h * sum_q A_{iq} f(t + c_q h, y + Z_q)
+        // (The y-term cancels because each stage subtracts y from Y_i = y + Z_i.)
         let mut resid = vec![0.0_f64; sn];
         for i in 0..s {
             for j in 0..n {
-                let mut acc = state.stages[i][j] - y[j];
+                let mut acc = state.increments[i][j];
                 for q in 0..s {
                     acc -= h * tableau.a[(i, q)] * fvals[q][j];
                 }
@@ -185,8 +206,10 @@ fn newton_loop(
         for i in 0..s {
             for j in 0..n {
                 let corr = dz[i * n + j];
-                state.stages[i][j] += corr;
-                max_corr = max_corr.max(corr.abs());
+                state.increments[i][j] += corr;
+                // Scale by stage size to weight in the convergence test.
+                let sc = 1.0_f64 + state.increments[i][j].abs();
+                max_corr = max_corr.max((corr / sc).abs());
             }
         }
 
@@ -194,6 +217,11 @@ fn newton_loop(
 
         if max_corr < tol {
             state.converged = true;
+            for i in 0..s {
+                for j in 0..n {
+                    state.stages[i][j] = y[j] + state.increments[i][j];
+                }
+            }
             jac_cache.increment_age();
             return Ok(state);
         }

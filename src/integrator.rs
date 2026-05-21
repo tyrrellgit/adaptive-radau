@@ -1,3 +1,5 @@
+use nalgebra::{DMatrix, DVector};
+
 use crate::dense_output::DenseOutput;
 use crate::error::{RadauError, Result};
 use crate::newton::{solve_step, CachedJacobian, NewtonLinearAlgebra};
@@ -5,6 +7,14 @@ use crate::order_control::{OrderChange, OrderController};
 use crate::problem::OdeProblem;
 use crate::step_control::{propose_step, wrms_norm};
 use crate::tableau::TableauCache;
+
+#[derive(Debug, Clone)]
+pub struct SolveResult {
+    pub t: f64,
+    pub y: Vec<f64>,
+    pub steps_accepted: usize,
+    pub steps_rejected: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum LinearSolveStrategy {
@@ -89,6 +99,36 @@ impl RadauIntegrator {
         }
     }
 
+    pub fn solve(
+        &mut self,
+        t_end: f64,
+        problem: &impl OdeProblem,
+    ) -> Result<SolveResult> {
+        assert!(t_end > self.t, "t_end must be greater than initial t");
+
+        let mut steps_accepted = 0;
+        let mut steps_rejected = 0;
+
+        while t_end - self.t > 1e-14 * t_end.abs().max(1.0) {
+            self.h = self.h.min(t_end - self.t).max(self.options.min_step);
+
+            let step = self.step(problem)?;
+
+            if step.accepted {
+                steps_accepted += 1;
+            } else {
+                steps_rejected += 1;
+            }
+        }
+
+        Ok(SolveResult {
+            t: self.t,
+            y: self.y.clone(),
+            steps_accepted,
+            steps_rejected,
+        })
+    }
+
     fn choose_linear_algebra(&mut self, n: usize) -> NewtonLinearAlgebra {
         match self.options.linear_solver {
             LinearSolveStrategy::Auto => {
@@ -140,7 +180,6 @@ impl RadauIntegrator {
                 Err(e) => return Err(e),
             };
 
-            let n = self.y.len();
             let s = tableau.stages;
             let mut fvals = vec![vec![0.0; n]; s];
             for i in 0..s {
@@ -148,29 +187,49 @@ impl RadauIntegrator {
                 problem.rhs(ti, &newton.stages[i], &mut fvals[i]);
             }
 
+            // y_next from the main weights b (stiffly-accurate: b == last row of A,
+            // so y_next == stages[s-1], but we keep the explicit form for clarity).
             let mut y_next = self.y.clone();
-            let mut y_emb = self.y.clone();
             for j in 0..n {
                 for i in 0..s {
                     y_next[j] += self.h * tableau.b[i] * fvals[i][j];
-                    y_emb[j] += self.h * tableau.b_hat[i] * fvals[i][j];
                 }
             }
 
-            let err: Vec<f64> = y_next.iter().zip(y_emb.iter()).map(|(a, b)| a - b).collect();
-            let err_norm = wrms_norm(&err, &y_next, self.options.rtol, self.options.atol);
+            // Hairer's ESTRAD error estimator (dc_decsol.f, subroutine ESTRAD).
+            //   F2[j]   = sum_i (DD_i / h) * (Y_i - y_n)[j]    // stage *increments*
+            //   CONT[j] = F2[j] + f(t_n, y_n)[j]               // add f at y_n
+            //   err[j]  = (I - h γ J)^{-1} CONT                 // smooth
+            // The DD coefficients satisfy moment cancellation against the leading
+            // collocation residual: F2 ≈ -f(y_n) to (s-1)th order, so CONT is
+            // O(h^s) and matches the embedded-method order naturally.
+            let mut f_yn = vec![0.0_f64; n];
+            problem.rhs(self.t, &self.y, &mut f_yn);
 
-            let order_change = self.order_control.update(newton.iter_count);
-            if order_change != OrderChange::Unchanged {
-                self.jac_cache.age = self.jac_cache.max_age;
+            // Use stage *increments* Z_i = Y_i - y_n directly from the Newton
+            // state, not Y_i - y_n via subtraction. Subtraction would lose
+            // precision when |Y_i| ≈ |y_n| but Z_i is small, which is exactly
+            // the regime where ESTRAD's 1/h scaling amplifies any noise into
+            // the error estimate.
+            let mut cont = vec![0.0_f64; n];
+            for j in 0..n {
+                let mut f2 = 0.0_f64;
+                for i in 0..s {
+                    f2 += tableau.dd[i] * newton.increments[i][j];
+                }
+                cont[j] = f2 / self.h + f_yn[j];
             }
+            let err_smoothed = smooth_error(&cont, &self.jac_cache.jac, self.h, tableau.u1);
 
-            let (h_new, accepted) = propose_step(
-                self.h,
-                err_norm,
-                self.order_control.current_order,
-                newton.iter_count,
+            let err_norm = wrms_norm(
+                &err_smoothed,
+                &self.y,
+                &y_next,
+                self.options.rtol,
+                self.options.atol,
             );
+
+            let (h_new, accepted) = propose_step(self.h, err_norm, tableau.embedded_order);
 
             if accepted {
                 let dense = DenseOutput {
@@ -185,6 +244,11 @@ impl RadauIntegrator {
                 self.y = y_next.clone();
                 self.h = h_new.clamp(self.options.min_step, self.options.max_step);
 
+                let order_change = self.order_control.update(newton.iter_count);
+                if order_change != OrderChange::Unchanged {
+                    self.jac_cache.mark_stale();
+                }
+
                 return Ok(StepOutcome {
                     t: self.t,
                     y: y_next,
@@ -195,11 +259,31 @@ impl RadauIntegrator {
                 });
             }
 
-            self.jac_cache.age = self.jac_cache.max_age;
+            // Step rejected: shrink h, keep Jacobian (still valid at current
+            // y), and retry without updating the order controller.
             self.h = h_new.clamp(self.options.min_step, self.options.max_step);
             if self.h <= self.options.min_step {
                 return Err(RadauError::StepUnderflow);
             }
         }
+    }
+}
+
+/// Hairer ESTRAD smoothing: solve (I − h γ J) · err_smoothed = err.
+/// Cost: one extra n×n LU per step. We could cache this factor along the
+/// real block of the block-diagonal solver; left as a future optimisation.
+fn smooth_error(err: &[f64], jac: &DMatrix<f64>, h: f64, u1: f64) -> Vec<f64> {
+    let n = err.len();
+    let gamma = 1.0 / u1;
+    let mut m = DMatrix::<f64>::identity(n, n);
+    for r in 0..n {
+        for c in 0..n {
+            m[(r, c)] -= h * gamma * jac[(r, c)];
+        }
+    }
+    let rhs = DVector::from_column_slice(err);
+    match m.lu().solve(&rhs) {
+        Some(sol) => sol.iter().copied().collect(),
+        None => err.to_vec(), // singular: fall back to raw err
     }
 }
