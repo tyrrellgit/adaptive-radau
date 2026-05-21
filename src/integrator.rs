@@ -1,10 +1,17 @@
 use crate::dense_output::DenseOutput;
 use crate::error::{RadauError, Result};
-use crate::newton::{solve_step, CachedJacobian};
+use crate::newton::{solve_step, CachedJacobian, NewtonLinearAlgebra};
 use crate::order_control::{OrderChange, OrderController};
 use crate::problem::OdeProblem;
 use crate::step_control::{propose_step, wrms_norm};
 use crate::tableau::TableauCache;
+
+#[derive(Debug, Clone, Copy)]
+pub enum LinearSolveStrategy {
+    Auto,
+    Kronecker,
+    BlockDiagonal,
+}
 
 #[derive(Debug, Clone)]
 pub struct IntegratorOptions {
@@ -18,21 +25,27 @@ pub struct IntegratorOptions {
     pub max_order: usize,
     pub newton_tol: f64,
     pub max_newton_iter: usize,
+
+    pub linear_solver: LinearSolveStrategy,
+    pub block_diag_warn_below: usize,
 }
 
 impl Default for IntegratorOptions {
     fn default() -> Self {
         Self {
-            rtol:             1e-6,
-            atol:             1e-9,
-            initial_step:     1e-3,
-            min_step:         1e-12,
-            max_step:         1.0,
-            initial_order:    5,
-            min_order:        5,
-            max_order:        13,
-            newton_tol:       1e-10,
-            max_newton_iter:  12,
+            rtol: 1e-6,
+            atol: 1e-9,
+            initial_step: 1e-3,
+            min_step: 1e-12,
+            max_step: 1.0,
+            initial_order: 5,
+            min_order: 5,
+            max_order: 13,
+            newton_tol: 1e-10,
+            max_newton_iter: 12,
+
+            linear_solver: LinearSolveStrategy::Auto,
+            block_diag_warn_below: 50,
         }
     }
 }
@@ -55,6 +68,7 @@ pub struct RadauIntegrator {
     pub order_control: OrderController,
     pub tableaux: TableauCache,
     pub jac_cache: CachedJacobian,
+    warned_block_diag_small: bool,
 }
 
 impl RadauIntegrator {
@@ -62,6 +76,7 @@ impl RadauIntegrator {
         let h0 = options.initial_step;
         let (io, lo, ho) = (options.initial_order, options.min_order, options.max_order);
         let n = y0.len();
+
         Self {
             t: t0,
             y: y0,
@@ -70,12 +85,38 @@ impl RadauIntegrator {
             options,
             tableaux: TableauCache::default(),
             jac_cache: CachedJacobian::new(n),
+            warned_block_diag_small: false,
+        }
+    }
+
+    fn choose_linear_algebra(&mut self, n: usize) -> NewtonLinearAlgebra {
+        match self.options.linear_solver {
+            LinearSolveStrategy::Auto => {
+                if n <= self.options.block_diag_warn_below {
+                    NewtonLinearAlgebra::KroneckerFull
+                } else {
+                    NewtonLinearAlgebra::BlockDiagonal
+                }
+            }
+            LinearSolveStrategy::Kronecker => NewtonLinearAlgebra::KroneckerFull,
+            LinearSolveStrategy::BlockDiagonal => {
+                if n < self.options.block_diag_warn_below && !self.warned_block_diag_small {
+                    eprintln!(
+                        "warning: block-diagonal linear solver selected for dim={}, below recommended threshold {}; this may be slower than the direct Kronecker solve",
+                        n, self.options.block_diag_warn_below
+                    );
+                    self.warned_block_diag_small = true;
+                }
+                NewtonLinearAlgebra::BlockDiagonal
+            }
         }
     }
 
     pub fn step(&mut self, problem: &dyn OdeProblem) -> Result<StepOutcome> {
         loop {
             let tableau = self.tableaux.get(self.order_control.current_order)?.clone();
+            let n = self.y.len();
+            let linear_algebra = self.choose_linear_algebra(n);
 
             let newton = match solve_step(
                 problem,
@@ -86,11 +127,10 @@ impl RadauIntegrator {
                 &mut self.jac_cache,
                 self.options.newton_tol,
                 self.options.max_newton_iter,
+                linear_algebra,
             ) {
                 Ok(n) => n,
                 Err(RadauError::NewtonFailed) => {
-                    // Jacobian already marked stale inside solve_step.
-                    // Halve the step and retry.
                     self.h *= 0.5;
                     if self.h < self.options.min_step {
                         return Err(RadauError::StepUnderflow);
@@ -108,26 +148,19 @@ impl RadauIntegrator {
                 problem.rhs(ti, &newton.stages[i], &mut fvals[i]);
             }
 
-            // High-order solution
             let mut y_next = self.y.clone();
-            // Embedded lower-order solution for error estimate
-            let mut y_emb  = self.y.clone();
+            let mut y_emb = self.y.clone();
             for j in 0..n {
                 for i in 0..s {
-                    y_next[j] += self.h * tableau.b[i]     * fvals[i][j];
-                    y_emb[j]  += self.h * tableau.b_hat[i] * fvals[i][j];
+                    y_next[j] += self.h * tableau.b[i] * fvals[i][j];
+                    y_emb[j] += self.h * tableau.b_hat[i] * fvals[i][j];
                 }
             }
 
-            let err: Vec<f64> = y_next.iter().zip(y_emb.iter())
-                .map(|(a, b)| a - b)
-                .collect();
+            let err: Vec<f64> = y_next.iter().zip(y_emb.iter()).map(|(a, b)| a - b).collect();
             let err_norm = wrms_norm(&err, &y_next, self.options.rtol, self.options.atol);
 
             let order_change = self.order_control.update(newton.iter_count);
-
-            // If order changed, invalidate Jacobian cache so we refactor
-            // with the correct stage structure on the next step
             if order_change != OrderChange::Unchanged {
                 self.jac_cache.age = self.jac_cache.max_age;
             }
@@ -141,28 +174,27 @@ impl RadauIntegrator {
 
             if accepted {
                 let dense = DenseOutput {
-                    t_n:        self.t,
-                    h:          self.h,
-                    y_n:        self.y.clone(),
+                    t_n: self.t,
+                    h: self.h,
+                    y_n: self.y.clone(),
                     stage_vals: newton.stages.clone(),
-                    c:          tableau.c.clone(),
+                    c: tableau.c.clone(),
                 };
 
                 self.t += self.h;
-                self.y  = y_next.clone();
-                self.h  = h_new.clamp(self.options.min_step, self.options.max_step);
+                self.y = y_next.clone();
+                self.h = h_new.clamp(self.options.min_step, self.options.max_step);
 
                 return Ok(StepOutcome {
-                    t:            self.t,
-                    y:            y_next,
+                    t: self.t,
+                    y: y_next,
                     dense,
-                    accepted:     true,
+                    accepted: true,
                     newton_iters: newton.iter_count,
                     order_change,
                 });
             }
 
-            // Step rejected — shrink step and mark Jacobian stale
             self.jac_cache.age = self.jac_cache.max_age;
             self.h = h_new.clamp(self.options.min_step, self.options.max_step);
             if self.h <= self.options.min_step {
