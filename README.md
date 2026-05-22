@@ -28,3 +28,13 @@ cargo bench --bench tableau
 
 HTML reports (with the default `html_reports` feature enabled) are written
 to `target/criterion/report/index.html`.
+
+## Other stuff
+Below are a few features or ideas being planned for the library, in no particular order of priority:
+
+- Explicit RK steppers (embedded and dense)
+- Schur factorisation for large dimensions (n>50)
+- Fast jacobians from compile time automatic differentiation (AD)
+- General Compatability with compile time AD (differentiable stiff solvers)
+- Demonstrations for various common examples 
+- Python bindings
