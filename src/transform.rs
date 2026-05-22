@@ -1,10 +1,12 @@
 //! Block-diagonal transform support for Radau IIA.
 //!
-//! For now this file only provides the data structures and block-factor
-//! builder needed by the adaptive Newton solver. The current implementation
-//! uses a conservative identity transform placeholder, which keeps the code
-//! correct while allowing the solver to switch between direct Kronecker
-//! solves and future block-diagonal solves.
+//! The Schur decomposition of A^{-1} reveals its eigenstructure:
+//! - One real eigenvalue (u1)
+//! - (s-1)/2 complex conjugate pairs
+//!
+//! This module provides transformation matrices that permute stages into
+//! block-diagonal form, allowing the Newton solver to work with separated
+//! real and complex subsystems.
 
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 
@@ -23,18 +25,80 @@ pub struct BlockDiagTransform {
 }
 
 impl BlockDiagTransform {
-    /// Placeholder transform.
+    /// Build transformation from Schur decomposition of A^{-1}.
     ///
-    /// This keeps the API stable while we build out the true Hairer-style
-    /// block-diagonal decomposition. For odd-stage Radau IIA, the eventual
-    /// implementation will populate one real block and (s-1)/2 complex pairs.
+    /// Decomposes A_inv = Q T Q^T where T is quasi-triangular with:
+    /// - 1×1 blocks for real eigenvalues
+    /// - 2×2 blocks for complex conjugate pairs
+    ///
+    /// Returns a transform that:
+    /// - Extracts the real eigenvalue λ₁ and complex pairs {αⱼ ± iβⱼ}
+    /// - Builds transformation matrices to permute stages into block-diagonal form:
+    ///   stage-stacked vector → [real block stages; complex pair stages...]
     pub fn from_a_inv(a_inv: &DMatrix<f64>) -> Self {
         let s = a_inv.nrows();
+        
+        // Compute Schur decomposition: A_inv = Q T Q^T
+        let schur = a_inv.clone().schur();
+        let (_q, t) = schur.unpack();
+
+        // Scan quasi-triangular form to identify real eigenvalue and complex pairs
+        let mut real_idx: Option<usize> = None;
+        let mut complex_blocks: Vec<(usize, usize)> = Vec::new();
+        
+        let mut i = 0;
+        while i < s {
+            let is_complex = i + 1 < s && t[(i + 1, i)].abs() > 1e-12;
+            if is_complex {
+                complex_blocks.push((i, i + 1));
+                i += 2;
+            } else {
+                if real_idx.is_none() {
+                    real_idx = Some(i);
+                }
+                i += 1;
+            }
+        }
+
+        assert_eq!(complex_blocks.len(), (s - 1) / 2,
+                   "Expected {} complex pairs, got {}", (s - 1) / 2, complex_blocks.len());
+
+        let real_idx = real_idx.expect("Radau IIA A^-1 must have a real eigenvalue");
+        let lambda_real = t[(real_idx, real_idx)];
+
+        // Extract complex pairs: for each 2×2 block in T, extract α ± iβ
+        let mut complex_pairs = Vec::new();
+        for (i1, i2) in &complex_blocks {
+            let alpha = t[(*i1, *i1)];
+            let beta = t[(*i2, *i1)];  // sub-diagonal element
+            complex_pairs.push(ComplexPair { alpha, beta });
+        }
+
+        // Build permutation that orders: [real_stage, complex_pairs_stages...]
+        let mut perm = Vec::new();
+        perm.push(real_idx);
+        for (i1, i2) in &complex_blocks {
+            perm.push(*i1);
+            perm.push(*i2);
+        }
+
+        // T_mat permutes from physical to block-diagonal coordinates
+        let mut t_mat = DMatrix::zeros(s, s);
+        for (bd_idx, phys_idx) in perm.iter().enumerate() {
+            t_mat[(bd_idx, *phys_idx)] = 1.0;
+        }
+
+        // T_inv_mat is the inverse permutation
+        let mut t_inv = DMatrix::zeros(s, s);
+        for (bd_idx, phys_idx) in perm.iter().enumerate() {
+            t_inv[(*phys_idx, bd_idx)] = 1.0;
+        }
+
         Self {
-            t_mat: DMatrix::identity(s, s),
-            t_inv: DMatrix::identity(s, s),
-            lambda_real: 1.0,
-            complex_pairs: Vec::new(),
+            t_mat,
+            t_inv,
+            lambda_real,
+            complex_pairs,
         }
     }
 
