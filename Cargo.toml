@@ -2,6 +2,11 @@
 name = "radau_rs"
 version = "0.1.0"
 edition = "2021"
+# Set by the dev-dependency chain (criterion -> clap 4.6), which is the binding
+# constraint; the library alone builds on considerably less. Verified by running
+# the full test suite under rustc 1.85.0. Raise this only alongside a re-run of
+# the suite on the new floor.
+rust-version = "1.85"
 license = "MIT"
 description = "Adaptive-order, adaptive-step Radau IIA integrator scaffold in Rust"
 
