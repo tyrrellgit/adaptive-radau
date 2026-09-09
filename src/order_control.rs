@@ -24,7 +24,10 @@ impl OrderController {
     }
 
     pub fn update(&mut self, iter: usize) -> OrderChange {
-        self.histiter = 0.8 * iter as f64 + 0.2 * self.histiter;
+        // Smoothed Newton-iteration count: heavily favour history so that a
+        // single easy step does not immediately escalate the order. This is
+        // the EMA form used in the arxiv:2412.14362 adaptive-Radau paper.
+        self.histiter = 0.8 * self.histiter + 0.2 * iter as f64;
         if self.histiter < 2.75 && self.current_order < self.max_order {
             self.current_order += 4;
             OrderChange::Raised

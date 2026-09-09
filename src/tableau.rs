@@ -1,6 +1,32 @@
+//! Radau IIA tableau builder.
+//!
+//! All coefficients are computed numerically from the canonical definition
+//! of Radau IIA collocation rather than typed by hand. This avoids the
+//! truncated / mis-transcribed entries that previously plagued the s=5 and
+//! s=7 tableaux, and lets us extend trivially to higher odd orders.
+//!
+//! Construction:
+//!   1. Nodes `c_i` are the roots of
+//!         d^{s-1}/dx^{s-1} [ x^{s-1} (x-1)^s ]
+//!      (the canonical right-Radau polynomial, see Hairer & Wanner II.5.21).
+//!   2. The collocation A matrix is the unique s×s matrix satisfying
+//!         sum_j A_{ij} c_j^{k-1} = c_i^k / k    for k = 1..=s
+//!      — i.e. each row is the Birkhoff/quadrature weights that integrate
+//!      degree (s-1) polynomials exactly over [0, c_i].
+//!   3. b_i := A_{s i} because c_s = 1.
+//!   4. b_hat is constructed from Hairer's ESTRAD error estimator:
+//!         b_hat = b - (last row of A^{-1}) / u1
+//!      where u1 is the unique real eigenvalue of A^{-1}. The estimate
+//!      `y_next - y_emb = h * sum_i (a_inv_last_row[i] / u1) f_i` is the
+//!      raw, unsmoothed Hairer error proxy. (Stiff problems additionally
+//!      smooth it with `(I − h γ J)^{-1}`; this is wired into the integrator.)
+
 use std::collections::HashMap;
+
 use nalgebra::DMatrix;
+
 use crate::error::{RadauError, Result};
+use crate::transform::BlockDiagTransform;
 
 #[derive(Debug, Clone)]
 pub struct RadauTableau {
@@ -10,7 +36,21 @@ pub struct RadauTableau {
     pub a: DMatrix<f64>,
     pub a_inv: DMatrix<f64>,
     pub b: Vec<f64>,
-    pub b_hat: Vec<f64>,
+    /// Hairer's ESTRAD coefficients (`DD_i` in radau5.f).
+    /// Uniquely determined by the moment conditions
+    ///   sum_i DD_i * c_i^k = 0   for k = 2..s-1
+    ///   sum_i DD_i * c_i     = -1
+    ///   DD_s = -1/s            (normalisation fixing the remaining degree of freedom)
+    /// The smoothed-form error estimate uses
+    ///   err_raw[j] = sum_i (DD_i / h) * (Y_i - y_n)[j]
+    ///   err[j]     = (I - h γ J)^{-1} * (err_raw + f(y_n))[j]
+    /// where γ = 1 / u1 and u1 is the real eigenvalue of A^{-1}.
+    pub dd: Vec<f64>,
+    /// Real eigenvalue of A^{-1}. Used as γ = 1/u1 in the stiff-error smoothing step.
+    pub u1: f64,
+    /// Order of the embedded method when used with smoothing: `s`.
+    pub embedded_order: usize,
+    pub transform: BlockDiagTransform,
 }
 
 #[derive(Debug, Default)]
@@ -29,108 +69,286 @@ impl TableauCache {
 }
 
 impl RadauTableau {
+    /// Build the Radau IIA tableau of classical order `2s − 1`.
+    /// Supported orders: any odd integer ≥ 3 (i.e. s ≥ 2). Higher orders
+    /// remain numerically clean up to s ≈ 9 with standard f64 root-finding.
     pub fn for_order(order: usize) -> Result<Self> {
-        match order {
-            5  => Ok(build_tableau(order5_c(),  order5_a())),
-            9  => Ok(build_tableau(order9_c(),  order9_a())),
-            13 => Ok(build_tableau(order13_c(), order13_a())),
-            17 | 21 | 25 => Err(RadauError::TableauNotImplemented(order)),
-            _  => Err(RadauError::InvalidOrder(order)),
+        if order < 3 || order % 2 == 0 {
+            return Err(RadauError::InvalidOrder(order));
         }
+        let s = (order + 1) / 2;
+        Ok(build_tableau(s))
     }
 }
 
-fn build_tableau(c: Vec<f64>, a_data: Vec<f64>) -> RadauTableau {
-    let s = c.len();
-    let order = 2 * s - 1;
-    let a = DMatrix::from_row_slice(s, s, &a_data);
-    let a_inv = a.clone().try_inverse()
-        .expect("Radau A matrix must be invertible");
+fn build_tableau(s: usize) -> RadauTableau {
+    let c = radau_iia_nodes(s);
+    let a = build_a_matrix(&c);
+    let a_inv = a.clone().try_inverse().expect("Radau A must be invertible");
     let b: Vec<f64> = a.row(s - 1).iter().copied().collect();
-    let b_hat = build_embedded_b(&c);
-    RadauTableau { order, stages: s, c, a, a_inv, b, b_hat }
+    let u1 = real_eigenvalue_of_a_inv(&a_inv);
+    let dd = hairer_dd_coefficients(&c);
+    let transform = BlockDiagTransform::from_a_inv(&a_inv);
+
+    RadauTableau {
+        order: 2 * s - 1,
+        stages: s,
+        c,
+        a,
+        a_inv,
+        b,
+        dd,
+        u1,
+        embedded_order: s,
+        transform,
+    }
 }
 
-fn build_embedded_b(c: &[f64]) -> Vec<f64> {
+/// Hairer ESTRAD coefficients.
+///
+/// We solve the linear system
+///   DD_s                              = -1/s          (normalisation)
+///   sum_j DD_j * c_j                   = -1
+///   sum_j DD_j * c_j^k                 =  0   for k = 2 .. s-1
+///
+/// For the 3-stage tableau this recovers Hairer's published values
+///   DD_1 = -(13 + 7√6)/3, DD_2 = (-13 + 7√6)/3, DD_3 = -1/3.
+fn hairer_dd_coefficients(c: &[f64]) -> Vec<f64> {
     let s = c.len();
-    let mut v = DMatrix::<f64>::zeros(s, s);
-    let mut rhs = vec![0.0; s];
-    for k in 0..s {
-        rhs[k] = 1.0 / ((k + 1) as f64);
-        for i in 0..s {
-            v[(k, i)] = c[i].powi(k as i32);
+    let mut m = DMatrix::<f64>::zeros(s, s);
+    let mut rhs = nalgebra::DVector::<f64>::zeros(s);
+
+    // Row 0: DD_s = -1/s
+    m[(0, s - 1)] = 1.0;
+    rhs[0] = -1.0 / s as f64;
+
+    // Row 1: sum DD_j * c_j = -1
+    for j in 0..s {
+        m[(1, j)] = c[j];
+    }
+    rhs[1] = -1.0;
+
+    // Rows 2..s-1: sum DD_j * c_j^k = 0   for k = 2..s-1
+    for row in 2..s {
+        let k = row as i32;
+        for j in 0..s {
+            m[(row, j)] = c[j].powi(k);
         }
     }
-    let rhsm = DMatrix::from_column_slice(s, 1, &rhs);
-    let sol = v.lu().solve(&rhsm)
-        .expect("embedded b_hat system must be solvable");
-    sol.column(0).iter().copied().collect()
+
+    let lu = m.lu();
+    let dd = lu.solve(&rhs).expect("DD linear system must be solvable");
+    (0..s).map(|i| dd[i]).collect()
 }
 
-// ── Order 5 (3 stages) ──────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Radau IIA nodes: roots of d^{s-1}/dx^{s-1} [ x^{s-1} (x-1)^s ].
+// ---------------------------------------------------------------------------
 
-fn order5_c() -> Vec<f64> {
-    vec![
-        (4.0 - 6.0_f64.sqrt()) / 10.0,
-        (4.0 + 6.0_f64.sqrt()) / 10.0,
-        1.0,
-    ]
+fn radau_iia_nodes(s: usize) -> Vec<f64> {
+    // Build coefficients of p(x) = x^{s-1} (x-1)^s in a monomial basis.
+    let deg_p = 2 * s - 1;
+    let mut p = vec![0.0_f64; deg_p + 1];
+    // (x - 1)^s expansion shifted by x^{s-1}
+    for k in 0..=s {
+        let coeff = (if k % 2 == 0 { 1.0 } else { -1.0 }) * binomial(s, k) as f64;
+        // coefficient of x^{(s) - k} in (x - 1)^s = (-1)^k C(s, k) x^{s-k}.
+        // After multiplying by x^{s-1}: degree (s - 1) + (s - k) = 2s - 1 - k.
+        p[2 * s - 1 - k] += coeff;
+    }
+
+    // Differentiate (s - 1) times.
+    let mut q = p;
+    for _ in 0..s - 1 {
+        q = differentiate(&q);
+    }
+    // q is now the degree-s Radau polynomial.
+
+    let roots = roots_real_in_unit_interval(&q, s);
+    debug_assert_eq!(roots.len(), s);
+    roots
 }
 
-fn order5_a() -> Vec<f64> {
-    vec![
-        0.196815477223660, -0.065535425850198,  0.023770974348220,
-        0.394424314739087,  0.292073411665228, -0.041548752125998,
-        0.376403062700467,  0.512485826188421,  0.111111111111111,
-    ]
+fn binomial(n: usize, k: usize) -> u128 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut num: u128 = 1;
+    let mut den: u128 = 1;
+    for i in 0..k {
+        num *= (n - i) as u128;
+        den *= (i + 1) as u128;
+    }
+    num / den
 }
 
-// ── Order 9 (5 stages) ──────────────────────────────────────────────────────
-// Source: Hairer & Wanner, "Solving ODEs II", Table 5.7
-
-fn order9_c() -> Vec<f64> {
-    vec![
-        0.057_104_196_114_518_17,
-        0.276_843_013_638_123_90,
-        0.583_590_432_368_916_90,
-        0.860_240_135_656_219_70,
-        1.0,
-    ]
+fn differentiate(p: &[f64]) -> Vec<f64> {
+    if p.len() <= 1 {
+        return vec![0.0];
+    }
+    p.iter()
+        .enumerate()
+        .skip(1)
+        .map(|(i, &c)| c * i as f64)
+        .collect()
 }
 
-fn order9_a() -> Vec<f64> {
-    vec![
-        0.072_998_864_317_634_60, -0.026_735_736_735_404_61,  0.018_676_929_925_112_27, -0.012_879_106_082_054_57,  0.005_042_839_233_882_19,
-        0.153_775_231_479_182_90,  0.146_774_435_584_572_40, -0.064_956_751_094_749_62,  0.035_671_282_696_425_48, -0.013_091_662_530_816_89,
-        0.140_063_045_684_809_60,  0.298_967_129_491_807_40,  0.167_585_136_305_968_40, -0.055_415_449_601_310_59,  0.015_716_837_295_116_70,
-        0.144_894_308_109_535_30,  0.276_500_068_760_689_60,  0.325_462_929_574_153_30,  0.128_564_689_798_411_40, -0.019_058_770_144_279_30,
-        0.143_713_560_791_226_50,  0.281_356_015_149_462_40,  0.311_826_522_975_741_70,  0.223_103_901_083_570_20,  0.040_000_000_000_000_01,
-    ]
+fn poly_eval(p: &[f64], x: f64) -> f64 {
+    // Horner
+    let mut acc = 0.0;
+    for &c in p.iter().rev() {
+        acc = acc * x + c;
+    }
+    acc
 }
 
-// ── Order 13 (7 stages) ─────────────────────────────────────────────────────
-// Source: Hairer & Wanner, "Solving ODEs II", Table 5.8
+/// Find all `s` real roots of `p` in [0, 1], to machine precision.
+/// We assume the roots are simple and well-separated, which is true for
+/// Radau IIA nodes. Strategy:
+///   1. Bracket via sign changes on a fine grid.
+///   2. Refine each bracket with bisection.
+///   3. Polish with Newton.
+fn roots_real_in_unit_interval(p: &[f64], expected: usize) -> Vec<f64> {
+    let dp = differentiate(p);
+    // Dense scan to find sign changes. Radau nodes for s up to ~20 are
+    // well-separated; 4000 samples easily resolves them.
+    const SAMPLES: usize = 4000;
+    let mut prev_x = 0.0;
+    let mut prev_y = poly_eval(p, prev_x);
+    let mut brackets: Vec<(f64, f64)> = Vec::new();
+    for k in 1..=SAMPLES {
+        let x = k as f64 / SAMPLES as f64;
+        let y = poly_eval(p, x);
+        if prev_y == 0.0 {
+            brackets.push((prev_x, prev_x));
+        } else if prev_y.signum() != y.signum() {
+            brackets.push((prev_x, x));
+        }
+        prev_x = x;
+        prev_y = y;
+    }
+    // Final endpoint x=1 is a root for Radau IIA — include if not already.
+    if poly_eval(p, 1.0).abs() < 1e-10 && brackets.last().map_or(true, |&(_, hi)| (hi - 1.0).abs() > 1e-12) {
+        brackets.push((1.0, 1.0));
+    }
+    assert_eq!(
+        brackets.len(),
+        expected,
+        "expected {} root brackets, found {}",
+        expected,
+        brackets.len()
+    );
 
-fn order13_c() -> Vec<f64> {
-    vec![
-        0.029_229_071_075_396_37,
-        0.147_505_462_937_064_70,
-        0.326_523_517_267_239_70,
-        0.535_328_836_398_264_80,
-        0.747_176_327_287_258_50,
-        0.919_533_848_028_569_90,
-        1.0,
-    ]
+    let mut roots = Vec::with_capacity(expected);
+    for (lo, hi) in brackets {
+        let mut a = lo;
+        let mut b = hi;
+        let mut fa = poly_eval(p, a);
+
+        // Bisection until interval is small.
+        if a != b {
+            for _ in 0..200 {
+                if (b - a) < 1e-15 {
+                    break;
+                }
+                let m = 0.5 * (a + b);
+                let fm = poly_eval(p, m);
+                if fm == 0.0 {
+                    a = m;
+                    b = m;
+                    break;
+                }
+                if fa.signum() * fm.signum() < 0.0 {
+                    b = m;
+                } else {
+                    a = m;
+                    fa = fm;
+                }
+            }
+        }
+        let mut x = 0.5 * (a + b);
+
+        // Newton polish.
+        for _ in 0..30 {
+            let f = poly_eval(p, x);
+            let df = poly_eval(&dp, x);
+            if df == 0.0 {
+                break;
+            }
+            let dx = f / df;
+            x -= dx;
+            if dx.abs() < f64::EPSILON * x.abs().max(1.0) {
+                break;
+            }
+        }
+        roots.push(x.clamp(0.0, 1.0));
+    }
+    roots.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    roots
 }
 
-fn order13_a() -> Vec<f64> {
-    vec![
-        0.037_591_572_856_766_26, -0.014_080_684_714_979_98,  0.010_547_109_730_529_03, -0.008_523_851_843_729_20,  0.007_003_246_093_044_03, -0.005_089_098_898_570_24,  0.001_974_938_466_770_46,
-        0.082_604_374_879_099_13,  0.078_121_737_659_882_86, -0.037_228_128_487_750_79,  0.023_609_779_017_126_60, -0.017_832_784_952_698_63,  0.012_305_254_330_967_28, -0.004_643_609_826_765_97,
-        0.076_696_662_491_423_96,  0.163_987_384_706_451_00,  0.094_242_473_783_579_86, -0.039_483_354_044_041_10,  0.023_742_082_340_697_54, -0.014_786_979_658_965_72,  0.005_259_817_063_039_63,
-        0.079_023_765_517_572_52,  0.158_614_553_933_975_40,  0.197_898_662_847_567_60,  0.080_178_490_818_497_76, -0.029_908_203_207_862_03,  0.015_947_099_258_741_77, -0.005_081_665_003_699_99,
-        0.079_441_786_689_729_39,  0.158_019_069_959_344_70,  0.193_737_779_795_527_40,  0.175_186_785_986_027_80,  0.046_764_530_869_065_08, -0.015_540_490_648_912_34,  0.004_040_367_818_682_80,
-        0.079_344_317_746_698_97,  0.158_284_218_701_519_30,  0.193_286_733_800_512_60,  0.171_739_386_742_499_70,  0.144_900_363_484_088_30,  0.021_072_550_052_282_41, -0.003_090_548_432_088_65,
-        0.079_362_786_226_950_25,  0.158_249_396_153_650_60,  0.193_336_557_302_697_50,  0.171_907_040_906_026_70,  0.143_157_891_175_561_80,  0.095_762_288_578_990_01,  0.025_000_000_000_000_01,
-    ]
+// ---------------------------------------------------------------------------
+// Collocation A matrix.
+//
+// For each row i, solve V^T a_i = rhs_i where V_{kj} = c_j^{k-1},
+// rhs_k = c_i^k / k. Vandermonde systems with distinct nodes are non-singular.
+// We solve via LU through nalgebra.
+// ---------------------------------------------------------------------------
+
+fn build_a_matrix(c: &[f64]) -> DMatrix<f64> {
+    let s = c.len();
+    // V_{k-1, j} = c_j^{k-1}  →  V is row-power, columns indexed by stage.
+    let mut v = DMatrix::<f64>::zeros(s, s);
+    for k in 1..=s {
+        for j in 0..s {
+            v[(k - 1, j)] = c[j].powi((k - 1) as i32);
+        }
+    }
+    let lu = v.lu();
+
+    let mut a = DMatrix::<f64>::zeros(s, s);
+    for i in 0..s {
+        let rhs = nalgebra::DVector::from_iterator(
+            s,
+            (1..=s).map(|k| c[i].powi(k as i32) / k as f64),
+        );
+        let row = lu.solve(&rhs).expect("Vandermonde solve must succeed");
+        for j in 0..s {
+            a[(i, j)] = row[j];
+        }
+    }
+    a
+}
+
+// ---------------------------------------------------------------------------
+// Real eigenvalue of A^{-1}.
+//
+// For Radau IIA, A^{-1} has exactly one real eigenvalue (u1) and
+// (s−1)/2 complex conjugate pairs. We extract them via the Schur form.
+// ---------------------------------------------------------------------------
+
+fn real_eigenvalue_of_a_inv(a_inv: &DMatrix<f64>) -> f64 {
+    let schur = a_inv.clone().schur();
+    let (_q, t) = schur.unpack();
+    let n = t.nrows();
+
+    let mut i = 0;
+    let mut real_eigs = Vec::new();
+    while i < n {
+        let is_complex_block = i + 1 < n && t[(i + 1, i)].abs() > 1e-12;
+        if is_complex_block {
+            i += 2;
+        } else {
+            real_eigs.push(t[(i, i)]);
+            i += 1;
+        }
+    }
+    assert_eq!(
+        real_eigs.len(),
+        1,
+        "Radau IIA A^-1 should have exactly one real eigenvalue, got {}",
+        real_eigs.len()
+    );
+    real_eigs[0]
 }

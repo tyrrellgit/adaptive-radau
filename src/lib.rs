@@ -10,7 +10,11 @@ pub mod transform;
 
 pub use dense_output::DenseOutput;
 pub use error::{RadauError, Result};
-pub use integrator::{IntegratorOptions, RadauIntegrator, StepOutcome};
+pub use integrator::{IntegratorOptions, LinearSolveStrategy, RadauIntegrator, SolveResult, StepOutcome};
 pub use order_control::{OrderChange, OrderController};
 pub use problem::OdeProblem;
 pub use tableau::{RadauTableau, TableauCache};
+
+
+#[cfg(test)]
+mod tests;

@@ -2,13 +2,25 @@
 name = "radau_rs"
 version = "0.1.0"
 edition = "2021"
+# Set by the dev-dependency chain (criterion -> clap 4.6), which is the binding
+# constraint; the library alone builds on considerably less. Verified by running
+# the full test suite under rustc 1.85.0. Raise this only alongside a re-run of
+# the suite on the new floor.
+rust-version = "1.85"
 license = "MIT"
 description = "Adaptive-order, adaptive-step Radau IIA integrator scaffold in Rust"
 
 [dependencies]
 nalgebra = { version = "0.33", features = ["std"] }
-num-complex = "0.4"
 thiserror = "1.0"
 
 [dev-dependencies]
-approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "integrator"
+harness = false
+
+[[bench]]
+name = "tableau"
+harness = false
