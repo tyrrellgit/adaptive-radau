@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use radau_rs::{IntegratorOptions, OdeProblem, RadauIntegrator};
+use radau_rs::{IntegratorOptions, LinearSolveStrategy, OdeProblem, RadauIntegrator};
 
 // --- Test problems --------------------------------------------------------
 
@@ -56,6 +56,35 @@ impl OdeProblem for VanDerPol {
     fn rhs(&self, _t: f64, y: &[f64], dydt: &mut [f64]) {
         dydt[0] = y[1];
         dydt[1] = self.mu * ((1.0 - y[0] * y[0]) * y[1] - y[0]);
+    }
+}
+
+/// 1-D heat equation by method of lines: `u_t = u_xx` on [0,1] with Dirichlet
+/// ends, `n` interior points. Stiff, and the dimension is a free parameter —
+/// this is the regime the block-diagonal (Schur) solver exists for.
+struct Heat1D {
+    n: usize,
+    inv_dx2: f64,
+}
+impl Heat1D {
+    fn new(n: usize) -> Self {
+        let dx = 1.0 / (n as f64 + 1.0);
+        Self { n, inv_dx2: 1.0 / (dx * dx) }
+    }
+    fn y0(&self) -> Vec<f64> {
+        (0..self.n)
+            .map(|i| (std::f64::consts::PI * (i as f64 + 1.0) / (self.n as f64 + 1.0)).sin())
+            .collect()
+    }
+}
+impl OdeProblem for Heat1D {
+    fn dim(&self) -> usize { self.n }
+    fn rhs(&self, _t: f64, y: &[f64], dydt: &mut [f64]) {
+        for i in 0..self.n {
+            let left = if i == 0 { 0.0 } else { y[i - 1] };
+            let right = if i + 1 == self.n { 0.0 } else { y[i + 1] };
+            dydt[i] = (left - 2.0 * y[i] + right) * self.inv_dx2;
+        }
     }
 }
 
@@ -280,11 +309,54 @@ fn bench_van_der_pol(c: &mut Criterion) {
     group.finish();
 }
 
+/// Kronecker vs block-diagonal (Schur) linear algebra as the dimension grows.
+/// The direct solve factorises one `(s*n)x(s*n)` matrix; the block solve does
+/// one `n x n` plus `(s-1)/2` `2n x 2n`. The crossover this measures is what
+/// `IntegratorOptions::block_diag_warn_below` should be set from.
+fn bench_linear_algebra_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("linear_algebra");
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(10);
+
+    for &n in &[2usize, 4, 6, 8, 10, 25, 50, 100, 200] {
+        let problem = Heat1D::new(n);
+        let y0 = problem.y0();
+        let t_end = 0.02_f64;
+
+        for &(strategy, label) in &[
+            (LinearSolveStrategy::Kronecker, "kronecker"),
+            (LinearSolveStrategy::BlockDiagonal, "block_diag"),
+        ] {
+            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
+                b.iter(|| {
+                    let opts = IntegratorOptions {
+                        rtol: 1e-6,
+                        atol: 1e-9,
+                        initial_step: 1e-6,
+                        max_step: t_end,
+                        initial_order: 9,
+                        min_order: 9,
+                        max_order: 9,
+                        linear_solver: strategy,
+                        block_diag_warn_below: 0, // silence the small-dim warning
+                        ..Default::default()
+                    };
+                    let mut s = RadauIntegrator::new(0.0, y0.clone(), opts);
+                    s.solve(t_end, black_box(&problem)).expect("solve failed")
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_decay_non_stiff,
     bench_decay_stiff,
     bench_robertson,
     bench_van_der_pol,
+    bench_linear_algebra_scaling,
 );
 criterion_main!(benches);

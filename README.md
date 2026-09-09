@@ -29,13 +29,29 @@ cargo bench --bench tableau
 HTML reports (with the default `html_reports` feature enabled) are written
 to `target/criterion/report/index.html`.
 
+## Linear algebra for the Newton iteration
+
+Each Radau step solves `(I - h A (x) J) dz = -r`. Two strategies are available
+via `IntegratorOptions::linear_solver`:
+
+- **Kronecker** — one direct `(s*n) x (s*n)` LU.
+- **Block-diagonal (Schur)** — real Schur decomposition `A^-1 = Q T Q^T`
+  reduces this to one `n x n` LU plus `(s-1)/2` `2n x 2n` LUs, solved by block
+  back-substitution.
+
+`Auto` (the default) picks between them on dimension. Measured on a
+method-of-lines heat equation at order 9, block-diagonal versus Kronecker:
+
+| n | 2 | 6 | 10 | 25 | 50 | 100 | 200 |
+|---|---|---|----|----|----|-----|-----|
+| speedup | 0.86x | 1.11x | 1.40x | 3.36x | 5.78x | 6.88x | 6.85x |
+
 ## Other stuff
 Below are a few features or ideas being planned for the library, in no particular order of priority:
 
 - IMEX RK methods / operator splitting
 - DRIK / ESDIRK methods
 - Explicit RK steppers (embedded and dense)
-- Schur factorisation for large dimensions (n>50)
 - Krylov‑based method for newton iterations
 - Fast jacobians from compile time automatic differentiation (AD)
 - General Compatability with compile time AD (differentiable stiff solvers)

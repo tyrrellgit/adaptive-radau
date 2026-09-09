@@ -7,11 +7,9 @@ description = "Adaptive-order, adaptive-step Radau IIA integrator scaffold in Ru
 
 [dependencies]
 nalgebra = { version = "0.33", features = ["std"] }
-num-complex = "0.4"
 thiserror = "1.0"
 
 [dev-dependencies]
-approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

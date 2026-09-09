@@ -33,10 +33,29 @@ pub struct IntegratorOptions {
     pub initial_order: usize,
     pub min_order: usize,
     pub max_order: usize,
-    pub newton_tol: f64,
+    /// Newton convergence threshold, as a *fraction of the integration
+    /// tolerance*: the iteration stops once the WRMS norm of the correction,
+    /// measured against `scal = atol + rtol|y|`, falls below it (radau5's
+    /// `FNEWT`). This is a relative quantity, not an absolute bound on the
+    /// correction.
+    ///
+    /// `None` (the default) derives it from `rtol` as radau5 does,
+    /// `min(0.03, sqrt(rtol))`, floored at `10ε/rtol` so it stays reachable in
+    /// f64. Prefer the default: too loose a Newton solve leaves `y` off the
+    /// slow manifold of a stiff problem, and that residual is amplified by the
+    /// error estimator into a step-size limit that never relaxes.
+    pub newton_tol: Option<f64>,
     pub max_newton_iter: usize,
 
     pub linear_solver: LinearSolveStrategy,
+    /// Dimension at or below which `LinearSolveStrategy::Auto` prefers the
+    /// direct Kronecker solve, and below which explicitly selecting the
+    /// block-diagonal solver warns.
+    ///
+    /// Measured crossover on a method-of-lines heat equation at order 9
+    /// (`benches/integrator.rs`, `linear_algebra` group): block-diagonal is
+    /// 0.86x at n=2, 1.11x at n=6, 1.25x at n=8, 3.4x at n=25, 5.8x at n=50
+    /// and 6.9x at n=100+. So the two are level around n=5.
     pub block_diag_warn_below: usize,
 }
 
@@ -51,11 +70,11 @@ impl Default for IntegratorOptions {
             initial_order: 5,
             min_order: 5,
             max_order: 13,
-            newton_tol: 1e-10,
+            newton_tol: None,
             max_newton_iter: 12,
 
             linear_solver: LinearSolveStrategy::Auto,
-            block_diag_warn_below: 50,
+            block_diag_warn_below: 5,
         }
     }
 }
@@ -68,6 +87,9 @@ pub struct StepOutcome {
     pub accepted: bool,
     pub newton_iters: usize,
     pub order_change: OrderChange,
+    /// WRMS norm of the embedded error estimate for this step. `<= 1` means
+    /// the step met the requested tolerance and was accepted.
+    pub err_norm: f64,
 }
 
 pub struct RadauIntegrator {
@@ -152,11 +174,31 @@ impl RadauIntegrator {
         }
     }
 
+    /// radau5's `FNEWT`: `max(10*uround/rtol, min(0.03, sqrt(rtol)))`, or the
+    /// user's override held to the same reachability floor.
+    fn effective_newton_tol(&self) -> f64 {
+        let rtol = self.options.rtol;
+        let auto = 0.03_f64.min(rtol.sqrt());
+        self.options
+            .newton_tol
+            .unwrap_or(auto)
+            .max(10.0 * f64::EPSILON / rtol)
+    }
+
     pub fn step(&mut self, problem: &dyn OdeProblem) -> Result<StepOutcome> {
         loop {
             let tableau = self.tableaux.get(self.order_control.current_order)?.clone();
             let n = self.y.len();
             let linear_algebra = self.choose_linear_algebra(n);
+
+            // radau5's SCAL, from the state at the start of the step.
+            let scal: Vec<f64> = self
+                .y
+                .iter()
+                .map(|yi| self.options.atol + self.options.rtol * yi.abs())
+                .collect();
+
+            let newton_tol = self.effective_newton_tol();
 
             let newton = match solve_step(
                 problem,
@@ -165,7 +207,8 @@ impl RadauIntegrator {
                 self.h,
                 &self.y,
                 &mut self.jac_cache,
-                self.options.newton_tol,
+                &scal,
+                newton_tol,
                 self.options.max_newton_iter,
                 linear_algebra,
             ) {
@@ -256,6 +299,7 @@ impl RadauIntegrator {
                     accepted: true,
                     newton_iters: newton.iter_count,
                     order_change,
+                    err_norm,
                 });
             }
 
@@ -269,17 +313,36 @@ impl RadauIntegrator {
     }
 }
 
-/// Hairer ESTRAD smoothing: solve (I − h γ J) · err_smoothed = err.
+/// Hairer ESTRAD smoothing: solve `E1 · err_smoothed = err` with
+/// `E1 = (u1/h) I − J`.
+///
+/// This is radau5's `E1` from DECOMR (`FAC1 = U1/H`), *not* `I − (h/u1) J`.
+/// Since `(u1/h) I − J = (u1/h) · (I − (h/u1) J)`, the normalised form scales
+/// the estimate by `u1/h` — wrong in both directions about `h = u1` (`≈ 3.64`
+/// at `s = 3`):
+///
+/// - `h < u1`: estimate inflated (`≈ 3.6e3` at `h = 1e-3`), so the controller
+///   shrinks `h` by that factor raised to `1/(s+1)` — worst at low order,
+///   where the exponent is largest.
+/// - `h > u1`: estimate deflated, so long-horizon runs take steps they have
+///   not earned and quietly miss the requested tolerance.
+///
+/// The dimensional check settles which is right: `cont` is in units of
+/// y/time, so the smoothing operator must carry units of 1/time for the
+/// estimate to come out in y and be comparable to `scal`. `(u1/h) I − J`
+/// does; the dimensionless `I − (h/u1) J` does not.
+///
 /// Cost: one extra n×n LU per step. We could cache this factor along the
 /// real block of the block-diagonal solver; left as a future optimisation.
 fn smooth_error(err: &[f64], jac: &DMatrix<f64>, h: f64, u1: f64) -> Vec<f64> {
     let n = err.len();
-    let gamma = 1.0 / u1;
-    let mut m = DMatrix::<f64>::identity(n, n);
+    let fac1 = u1 / h;
+    let mut m = DMatrix::<f64>::zeros(n, n);
     for r in 0..n {
         for c in 0..n {
-            m[(r, c)] -= h * gamma * jac[(r, c)];
+            m[(r, c)] = -jac[(r, c)];
         }
+        m[(r, r)] += fac1;
     }
     let rhs = DVector::from_column_slice(err);
     match m.lu().solve(&rhs) {

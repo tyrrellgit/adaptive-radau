@@ -82,6 +82,7 @@ pub fn solve_step(
     h: f64,
     y: &[f64],
     jac_cache: &mut CachedJacobian,
+    scal: &[f64],
     tol: f64,
     max_iter: usize,
     linear_algebra: NewtonLinearAlgebra,
@@ -92,10 +93,10 @@ pub fn solve_step(
 
     match linear_algebra {
         NewtonLinearAlgebra::KroneckerFull => {
-            solve_kronecker(problem, tableau, t, h, y, jac_cache, tol, max_iter)
+            solve_kronecker(problem, tableau, t, h, y, jac_cache, scal, tol, max_iter)
         }
         NewtonLinearAlgebra::BlockDiagonal => {
-            solve_block_diag(problem, tableau, t, h, y, jac_cache, tol, max_iter)
+            solve_block_diag(problem, tableau, t, h, y, jac_cache, scal, tol, max_iter)
         }
     }
 }
@@ -107,6 +108,7 @@ fn solve_kronecker(
     h: f64,
     y: &[f64],
     jac_cache: &mut CachedJacobian,
+    scal: &[f64],
     tol: f64,
     max_iter: usize,
 ) -> Result<NewtonState> {
@@ -131,7 +133,7 @@ fn solve_kronecker(
     }
     let lu = m.lu();
 
-    newton_loop(problem, tableau, t, h, y, jac_cache, tol, max_iter, |resid| {
+    newton_loop(problem, tableau, t, h, y, jac_cache, scal, tol, max_iter, |resid| {
         let neg = DVector::from_column_slice(resid).map(|x| -x);
         lu.solve(&neg).map(|v| v.iter().copied().collect())
     })
@@ -144,16 +146,19 @@ fn solve_block_diag(
     h: f64,
     y: &[f64],
     jac_cache: &mut CachedJacobian,
+    scal: &[f64],
     tol: f64,
     max_iter: usize,
 ) -> Result<NewtonState> {
     let n = y.len();
-    let factors = BlockFactors::build(&tableau.transform, &jac_cache.jac, h);
+    let transform = &tableau.transform;
+    let factors = BlockFactors::build(transform, &jac_cache.jac, h);
 
-    newton_loop(problem, tableau, t, h, y, jac_cache, tol, max_iter, |resid| {
-        let (r_real, r_complex) = tableau.transform.transform_residual(resid, n);
-        let (z_real, z_complex) = factors.solve(&r_real, &r_complex)?;
-        Some(tableau.transform.back_transform(&z_real, &z_complex, n))
+    newton_loop(problem, tableau, t, h, y, jac_cache, scal, tol, max_iter, |resid| {
+        // (T ⊗ I − h I ⊗ J) w = −(T Qᵀ ⊗ I) r,  then Δz = (Q ⊗ I) w.
+        let rhs = transform.transform_residual(resid, n);
+        let w = factors.solve(transform, &rhs)?;
+        Some(transform.back_transform(&w, n))
     })
 }
 
@@ -164,6 +169,7 @@ fn newton_loop(
     h: f64,
     y: &[f64],
     jac_cache: &mut CachedJacobian,
+    scal: &[f64],
     tol: f64,
     max_iter: usize,
     linear_solve: impl Fn(&[f64]) -> Option<Vec<f64>>,
@@ -176,6 +182,7 @@ fn newton_loop(
     let mut fvals = vec![vec![0.0; n]; s];
     // Y_i = y + Z_i; updated whenever Z is corrected.
     let mut y_stage = vec![0.0; n];
+    let mut dyno_prev: Option<f64> = None;
 
     for iter in 0..max_iter {
         for i in 0..s {
@@ -202,20 +209,28 @@ fn newton_loop(
 
         let dz = linear_solve(&resid).ok_or(RadauError::LinearSolveFailed)?;
 
-        let mut max_corr = 0.0_f64;
+        // Convergence is measured on the WRMS norm of the correction against
+        // the *integration* scale `scal = atol + rtol|y|` (radau5's DYNO), not
+        // on an absolute floor. A fixed absolute tolerance is blind to
+        // component magnitude: on Robertson the tiny middle species sits near
+        // 1e-9, so a 1e-10 absolute floor accepted corrections larger than the
+        // increment itself, leaving `y` off the slow manifold. That residual
+        // then leaks through the near-singular ESTRAD smoothing matrix into
+        // the slow direction and pins the step size.
+        let mut dyno = 0.0_f64;
         for i in 0..s {
             for j in 0..n {
                 let corr = dz[i * n + j];
                 state.increments[i][j] += corr;
-                // Scale by stage size to weight in the convergence test.
-                let sc = 1.0_f64 + state.increments[i][j].abs();
-                max_corr = max_corr.max((corr / sc).abs());
+                let w = corr / scal[j];
+                dyno += w * w;
             }
         }
+        let dyno = (dyno / sn as f64).sqrt();
 
         state.iter_count = iter + 1;
 
-        if max_corr < tol {
+        if dyno < tol {
             state.converged = true;
             for i in 0..s {
                 for j in 0..n {
@@ -226,9 +241,26 @@ fn newton_loop(
             return Ok(state);
         }
 
-        if iter >= 4 && max_corr > 0.5 {
-            jac_cache.mark_stale();
+        // Contraction-rate test (radau5 RADCOR): bail as soon as the iteration
+        // is not contracting, rather than burning the full iteration budget.
+        if let Some(prev) = dyno_prev {
+            let theta = dyno / prev;
+            if theta >= 0.99 {
+                jac_cache.mark_stale();
+                return Err(RadauError::NewtonFailed);
+            }
+            // Predicted correction after the remaining iterations; if it can't
+            // reach `tol` in the budget left, stop now.
+            let remaining = max_iter.saturating_sub(iter + 1);
+            if remaining > 0 {
+                let predicted = dyno * theta.powi(remaining as i32) / (1.0 - theta);
+                if predicted >= tol {
+                    jac_cache.mark_stale();
+                    return Err(RadauError::NewtonFailed);
+                }
+            }
         }
+        dyno_prev = Some(dyno);
     }
 
     jac_cache.mark_stale();

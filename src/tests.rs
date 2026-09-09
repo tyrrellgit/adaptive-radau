@@ -4,3 +4,5 @@ mod test_step_control;
 mod test_order_control;
 mod test_newton;
 mod test_integrator;
+mod test_transform;
+mod test_error_estimate;
